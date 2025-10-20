@@ -4,12 +4,8 @@ export type TimeEntry = {
   _id?: string;
   _rev?: string;
   employeeId: string;
-  date: string; // YYYY-MM-DD (lokale TZ)
+  date: string;
   intervals: TimeInterval[];
-  approved?: boolean;            // true = freigegeben, false = abgelehnt, undefined = offen
-  approvedBy?: string;           // Reviewer-ID (JWT sub)
-  approvedAt?: string;           // ISO Datum/Zeit
-  deniedReason?: string;         // optionaler Ablehnungsgrund
   updatedAt: string;
 };
 
@@ -19,5 +15,14 @@ export type AppUser = {
   passwordHash: string;
   role: "employee" | "reviewer" | "admin";
   createdAt: string;
-  mustChangePassword?: boolean;  // muss beim 1. Login PW ändern
+  mustChangePassword?: boolean;
+};
+
+export type AuditEvent = {
+  _id?: string;
+  ts: string;               // ISO Zeit
+  type: "login" | "password_change" | "times_write";
+  actorId?: string;         // JWT sub falls vorhanden
+  actorEmail?: string;
+  meta?: Record<string, any>;
 };

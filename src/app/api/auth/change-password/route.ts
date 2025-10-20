@@ -1,7 +1,7 @@
+// src/app/api/auth/change-password/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
-import { ensureDbs, usersUpdate } from "@/src/lib/couch";
-import { usersFindByEmail } from "@/src/lib/couch";
+import { ensureDbs, usersUpdate, usersFindByEmail, auditInsert } from "@/src/lib/couch";
 import { AppUser } from "@/src/lib/types";
 import { getAuth } from "@/src/lib/auth";
 
@@ -26,6 +26,13 @@ export async function POST(req: NextRequest) {
 
   const newHash = await bcrypt.hash(newPassword, 12);
   await usersUpdate<AppUser>(u._id!, u._rev!, { passwordHash: newHash, mustChangePassword: false });
+
+  await auditInsert({
+    ts: new Date().toISOString(),
+    type: "password_change",
+    actorId: u._id!,
+    actorEmail: u.email
+  });
 
   return NextResponse.json({ ok: true });
 }

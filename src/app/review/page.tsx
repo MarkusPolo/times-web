@@ -11,12 +11,7 @@ type Entry = {
   date: string;
   intervals: Interval[];
   updatedAt: string;
-  approved?: boolean;
-  approvedBy?: string;
-  approvedAt?: string;
-  deniedReason?: string;
 };
-
 type User = { id: string; email: string; role: "employee" | "reviewer" | "admin"; mustChangePassword?: boolean };
 
 export default function ReviewPage() {
@@ -34,7 +29,6 @@ function Client() {
   const [rows, setRows] = useState<Entry[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(false);
-  const [statusFilter, setStatusFilter] = useState<"all" | "open" | "approved" | "denied">("all");
 
   useEffect(() => {
     (async () => {
@@ -58,23 +52,13 @@ function Client() {
   };
 
   useEffect(() => {
-    // initial erstes Laden (optional)
     load().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const filtered = useMemo(() => {
-    return rows.filter((e) => {
-      if (statusFilter === "open") return typeof e.approved === "undefined";
-      if (statusFilter === "approved") return e.approved === true;
-      if (statusFilter === "denied") return e.approved === false;
-      return true;
-    });
-  }, [rows, statusFilter]);
-
   const grouped = useMemo(() => {
     const map = new Map<string, Entry[]>();
-    for (const e of filtered) {
+    for (const e of rows) {
       const key = `${e.employeeId}__${e.date}`;
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(e);
@@ -86,97 +70,58 @@ function Client() {
     }
     out.sort((a, b) => (a.date < b.date ? 1 : -1));
     return out;
-  }, [filtered]);
+  }, [rows]);
 
-  // Stunden-Berechnungen
   function intervalMinutes(i: Interval) {
-    // HH:mm -> Minuten (ohne TZ, MVP)
     const [sh, sm] = i.start.split(":").map((n) => parseInt(n, 10));
     const [eh, em] = i.end.split(":").map((n) => parseInt(n, 10));
-    return (eh * 60 + em) - (sh * 60 + sm);
+    const delta = (eh * 60 + em) - (sh * 60 + sm);
+    return delta < 0 ? delta + 24 * 60 : delta; // über Mitternacht (MVP)
   }
-
   function entryMinutes(e: Entry) {
     return e.intervals.reduce((sum, i) => sum + Math.max(0, intervalMinutes(i)), 0);
   }
-
   const totals = useMemo(() => {
-    // Tagessumme + Mitarbeiter -> Summen
-    const dayTotals = new Map<string, number>(); // date -> minutes
-    const userTotals = new Map<string, number>(); // emp -> minutes
+    const dayTotals = new Map<string, number>();
+    const userTotals = new Map<string, number>();
     for (const g of grouped) {
       const minutes = g.entries.reduce((s, e) => s + entryMinutes(e), 0);
       dayTotals.set(g.date, (dayTotals.get(g.date) || 0) + minutes);
       userTotals.set(g.employeeId, (userTotals.get(g.employeeId) || 0) + minutes);
     }
-    const monthTotals = new Map<string, number>(); // yyyy-mm -> minutes
+    const monthTotals = new Map<string, number>();
     for (const [d, min] of dayTotals) {
       const m = d.slice(0, 7);
       monthTotals.set(m, (monthTotals.get(m) || 0) + min);
     }
-    // Woche (ISO): wir approximieren: KW = yyyy-Www aus Datum
     const weekTotals = new Map<string, number>();
     for (const [d, min] of dayTotals) {
       const kw = isoWeekKey(d);
       weekTotals.set(kw, (weekTotals.get(kw) || 0) + min);
     }
-    return {
-      dayTotals,
-      weekTotals,
-      monthTotals,
-      userTotals
-    };
+    return { dayTotals, weekTotals, monthTotals, userTotals };
   }, [grouped]);
 
   function isoWeekKey(yyyyMmDd: string) {
-    // einfache ISO-Wochenberechnung mit Date: für MVP ok
     const [y, m, d] = yyyyMmDd.split("-").map((n) => parseInt(n, 10));
     const date = new Date(Date.UTC(y, m - 1, d));
-    // Donnerstag in dieser Woche:
     const day = date.getUTCDay() || 7;
     date.setUTCDate(date.getUTCDate() + 4 - day);
     const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
     const weekNo = Math.ceil(((+date - +yearStart) / 86400000 + 1) / 7);
     return `${date.getUTCFullYear()}-W${String(weekNo).padStart(2, "0")}`;
   }
-
   function minToHours(m: number) {
     return (m / 60).toFixed(2);
   }
 
-  async function approve(id: string) {
-    await fetch("/api/review/approve", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) });
-    await load();
-  }
-  async function deny(id: string) {
-    const reason = prompt("Grund (optional)?") || "";
-    await fetch("/api/review/deny", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id, reason })
-    });
-    await load();
-  }
-
   function exportCSV() {
-    const rowsForCsv: string[][] = [
-      ["employee", "email", "date", "intervals", "minutes", "approved", "approvedBy", "approvedAt", "deniedReason"]
-    ];
+    const rowsForCsv: string[][] = [["employee", "email", "date", "intervals", "minutes"]];
     for (const g of grouped) {
       for (const e of g.entries) {
         const email = userLabel(users, e.employeeId);
         const intervals = e.intervals.map((i) => `${i.start}-${i.end}${i.note ? ` (${i.note})` : ""}`).join(", ");
-        rowsForCsv.push([
-          e.employeeId,
-          email,
-          e.date,
-          intervals,
-          String(entryMinutes(e)),
-          String(e.approved ?? ""),
-          e.approvedBy || "",
-          e.approvedAt || "",
-          e.deniedReason || ""
-        ]);
+        rowsForCsv.push([e.employeeId, email, e.date, intervals, String(entryMinutes(e))]);
       }
     }
     const csv = rowsForCsv.map((r) => r.map((x) => `"${(x ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -195,11 +140,7 @@ function Client() {
         email: userLabel(users, e.employeeId),
         date: e.date,
         intervals: e.intervals.map((i) => `${i.start}-${i.end}${i.note ? ` (${i.note})` : ""}`).join(", "),
-        minutes: entryMinutes(e),
-        approved: typeof e.approved === "undefined" ? "" : e.approved ? "approved" : "denied",
-        approvedBy: e.approvedBy || "",
-        approvedAt: e.approvedAt || "",
-        deniedReason: e.deniedReason || ""
+        minutes: entryMinutes(e)
       }))
     );
     const ws = XLSX.utils.json_to_sheet(data);
@@ -218,7 +159,7 @@ function Client() {
     <main>
       <h1>Review – Arbeitszeiten</h1>
 
-      <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr auto auto", gap: 8, alignItems: "end", margin: "16px 0" }}>
+      <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr auto auto", gap: 8, alignItems: "end", margin: "16px 0" }}>
         <label>
           Von
           <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
@@ -238,15 +179,6 @@ function Client() {
             ))}
           </select>
         </label>
-        <label>
-          Status
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as any)}>
-            <option value="all">Alle</option>
-            <option value="open">Offen</option>
-            <option value="approved">Freigegeben</option>
-            <option value="denied">Abgelehnt</option>
-          </select>
-        </label>
         <button onClick={load} disabled={loading}>
           {loading ? "Laden…" : "Filtern"}
         </button>
@@ -256,54 +188,7 @@ function Client() {
         </div>
       </section>
 
-      <section style={{ margin: "12px 0" }}>
-        <h3>Summen</h3>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
-          <div>
-            <strong>Pro Tag</strong>
-            <ul>
-              {Array.from(totals.dayTotals.entries())
-                .sort(([a], [b]) => (a < b ? 1 : -1))
-                .slice(0, 20)
-                .map(([d, m]) => (
-                  <li key={d}>{d}: {minToHours(m)} h</li>
-                ))}
-            </ul>
-          </div>
-          <div>
-            <strong>Pro Woche (ISO)</strong>
-            <ul>
-              {Array.from(totals.weekTotals.entries())
-                .sort(([a], [b]) => (a < b ? 1 : -1))
-                .slice(0, 12)
-                .map(([w, m]) => (
-                  <li key={w}>{w}: {minToHours(m)} h</li>
-                ))}
-            </ul>
-          </div>
-          <div>
-            <strong>Pro Monat</strong>
-            <ul>
-              {Array.from(totals.monthTotals.entries())
-                .sort(([a], [b]) => (a < b ? 1 : -1))
-                .slice(0, 12)
-                .map(([mo, m]) => (
-                  <li key={mo}>{mo}: {minToHours(m)} h</li>
-                ))}
-            </ul>
-          </div>
-          <div>
-            <strong>Pro Mitarbeiter</strong>
-            <ul>
-              {Array.from(totals.userTotals.entries())
-                .sort(([a], [b]) => (a < b ? 1 : -1))
-                .map(([emp, m]) => (
-                  <li key={emp}>{userLabel(users, emp)}: {minToHours(m)} h</li>
-                ))}
-            </ul>
-          </div>
-        </div>
-      </section>
+      <Summen totals={totals} users={users} />
 
       <section>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
@@ -313,39 +198,23 @@ function Client() {
               <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Datum</th>
               <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Blöcke</th>
               <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Minuten</th>
-              <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Status</th>
-              <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Aktionen</th>
             </tr>
           </thead>
           <tbody>
             {grouped.map((g) => {
-              // Die „group“ kann aus mehreren Einzel-Docs bestehen (z. B. mehrere Segmente)
               const flat = g.entries;
               const blocks = flat
                 .flatMap((e) => e.intervals.map((i) => `${i.start}–${i.end}${i.note ? ` (${i.note})` : ""}`))
                 .join(", ");
-              const minutes = flat.reduce((s, e) => s + entryMinutes(e), 0);
-
-              // Status: wenn alle approved===true -> freigegeben; wenn irgendein false -> abgelehnt; sonst offen
-              const statuses = flat.map((e) => e.approved);
-              const status =
-                statuses.every((s) => s === true) ? "freigegeben" :
-                statuses.some((s) => s === false) ? "abgelehnt" : "offen";
-
+              const minutes = flat.reduce((s, e) => {
+                return s + e.intervals.reduce((sum, i) => sum + Math.max(0, intervalMinutes(i)), 0);
+              }, 0);
               return (
                 <tr key={g.key}>
                   <td style={{ padding: "6px 0" }}>{userLabel(users, g.employeeId)}</td>
                   <td>{g.date}</td>
                   <td>{blocks}</td>
                   <td>{minutes}</td>
-                  <td>
-                    {status}
-                  </td>
-                  <td style={{ display: "flex", gap: 8 }}>
-                    {/* Aktion „Freigeben/Ablehnen“ wirkt auf ALLE Docs des Tages/Mitarbeiters */}
-                    <button onClick={() => Promise.all(flat.map((e) => approve(e._id))).then(load)}>Freigeben</button>
-                    <button onClick={() => Promise.all(flat.map((e) => deny(e._id))).then(load)}>Ablehnen</button>
-                  </td>
                 </tr>
               );
             })}
@@ -360,4 +229,69 @@ function Client() {
 function userLabel(users: User[], id: string) {
   const u = users.find((x) => x.id === id);
   return u ? `${u.email}` : id;
+}
+
+function Summen({
+  totals,
+  users
+}: {
+  totals: {
+    dayTotals: Map<string, number>;
+    weekTotals: Map<string, number>;
+    monthTotals: Map<string, number>;
+    userTotals: Map<string, number>;
+  };
+  users: User[];
+}) {
+  const minToHours = (m: number) => (m / 60).toFixed(2);
+  return (
+    <section style={{ margin: "12px 0" }}>
+      <h3>Summen</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
+        <div>
+          <strong>Pro Tag</strong>
+          <ul>
+            {Array.from(totals.dayTotals.entries())
+              .sort(([a], [b]) => (a < b ? 1 : -1))
+              .slice(0, 20)
+              .map(([d, m]) => (
+                <li key={d}>{d}: {minToHours(m)} h</li>
+              ))}
+          </ul>
+        </div>
+        <div>
+          <strong>Pro Woche (ISO)</strong>
+          <ul>
+            {Array.from(totals.weekTotals.entries())
+              .sort(([a], [b]) => (a < b ? 1 : -1))
+              .slice(0, 12)
+              .map(([w, m]) => (
+                <li key={w}>{w}: {minToHours(m)} h</li>
+              ))}
+          </ul>
+        </div>
+        <div>
+          <strong>Pro Monat</strong>
+          <ul>
+            {Array.from(totals.monthTotals.entries())
+              .sort(([a], [b]) => (a < b ? 1 : -1))
+              .slice(0, 12)
+              .map(([mo, m]) => (
+                <li key={mo}>{mo}: {minToHours(m)} h</li>
+              ))}
+          </ul>
+        </div>
+        <div>
+          <strong>Pro Mitarbeiter</strong>
+          <ul>
+            {Array.from(totals.userTotals.entries())
+              .sort(([a], [b]) => (a < b ? 1 : -1))
+              .map(([emp, m]) => (
+                <li key={emp}>{userLabel(users, emp)}: {minToHours(m)} h</li>
+              ))}
+          </ul>
+        </div>
+      </div>
+    </section>
+  );
 }
