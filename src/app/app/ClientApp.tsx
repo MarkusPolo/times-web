@@ -44,16 +44,23 @@ export default function ClientApp() {
   const refreshLockRef = useRef(false);
   const lastRefreshOkAtRef = useRef<number>(0);
 
-    tokenRef.current = localStorage.getItem("access_token");
+  async function refreshAccessToken() {
+    // Wenn gerade ein Refresh läuft, nicht noch einen starten
+    if (refreshLockRef.current) return false;
 
-    // User laden (für employeeId)
-    (async () => {
-      const r = await fetch("/api/auth/me");
-      if (r.ok) {
-        const j = (await r.json()) as MeResponse;
-        if (!cancelled) setMe(j.user ?? null);
-      } else {
-        if (!cancelled) setMe(null);
+    refreshLockRef.current = true;
+    try {
+      const r = await fetch("/api/auth/access", { method: "POST" });
+      if (!r.ok) return false;
+      const j = await r.json().catch(() => null);
+      if (j?.token) {
+        tokenRef.current = j.token;
+        localStorage.setItem("access_token", j.token); // nur für Proxy-Bearer (MVP)
+        lastRefreshOkAtRef.current = Date.now();
+
+        // Falls bisher kein Sync läuft, jetzt starten
+        if (!syncCancelRef.current) startSync();
+        return true;
       }
       return false;
     } catch {
@@ -63,44 +70,52 @@ export default function ClientApp() {
     }
   }
 
-    // Lokale DB
-    const localDb = new PouchDB<Entry>("times_local");
-    localDbRef.current = localDb;
+  function startSync() {
+    if (!localDbRef.current) return;
+    if (!tokenRef.current) {
+      setStatus("offline (kein Token)");
+      return;
+    }
 
-    // Initialbestand
-    localDb
-      .allDocs({ include_docs: true })
-      .then((res) => {
-        if (cancelled) return;
-        const list = res.rows
-          .map((r) => r.doc!)
-          .filter(isTimeEntry)
-          .sort((a, b) => (a.date < b.date ? 1 : -1));
-        setDocs(list);
+    const localDb = localDbRef.current;
+    const remoteUrl = `${window.location.origin}/api/couchdb/times`;
+
+    const fetchWithBearer: typeof fetch = async (url, opts) => {
+      const h = new Headers(opts?.headers || {});
+      const t = tokenRef.current;
+      if (t) h.set("authorization", `Bearer ${t}`);
+      return fetch(url, { ...opts, headers: h });
+    };
+
+    // @ts-ignore fetch-Override ist in pouchdb-browser erlaubt
+    const remote = new PouchDB<Entry>(remoteUrl, { fetch: fetchWithBearer });
+
+    const sync = PouchDB.sync(localDb, remote, { live: true, retry: true })
+      .on("change", () => setStatus("syncing"))
+      .on("paused", (err) => setStatus(err ? "paused (err)" : "paused"))
+      .on("active", () => setStatus("active"))
+      .on("denied", (e: any) => {
+        setStatus("denied");
+        console.error("[Pouch] denied", e);
       })
-      .catch((e) => console.error("[Pouch] allDocs error:", e));
+      .on("error", async (e: any) => {
+        const code = e?.status || e?.statusCode;
+        // 401/403 -> sofort reauth versuchen, aber Doppelaufrufe vermeiden
+        if (code === 401 || code === 403) {
+          setStatus("reauth…");
+          const ok = await refreshAccessToken();
+          if (ok) return; // Sync mit retry:true holt sich neues Token automatisch
+        }
+        setStatus("error");
+        console.error("[Pouch] sync error", e);
+      });
 
-    // Live-Changes
-    const changes = localDb
-      .changes({ since: "now", live: true, include_docs: true })
-      .on("change", (c) => {
-        const d = c.doc as Entry;
-        if (!isTimeEntry(d)) return; // ignorier alte/inkonsistente Docs
-        setDocs((prev) => {
-          const i = prev.findIndex((x) => x._id === d._id);
-          if (i >= 0) {
-            const cp = prev.slice();
-            cp[i] = d;
-            return cp.sort((a, b) => (a.date < b.date ? 1 : -1));
-          }
-          return [d, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1));
-        });
-      })
-      .on("error", (e) => console.error("[Pouch] changes error:", e));
-
-    // Replikation
-    let cancelSync: (() => void) | null = null;
-    const token = tokenRef.current;
+    syncCancelRef.current = () => {
+      // @ts-ignore
+      sync.cancel();
+      syncCancelRef.current = null;
+    };
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -109,16 +124,51 @@ export default function ClientApp() {
       // 1) Initial versuchen, Access zu holen (via Refresh)
       await refreshAccessToken();
 
-      // @ts-ignore fetch-Override ist in pouchdb-browser erlaubt
-      const remote = new PouchDB<Entry>(remoteUrl, { fetch: fetchWithBearer });
+      // 2) User laden (für employeeId)
+      try {
+        const r = await fetch("/api/auth/me");
+        if (r.ok) {
+          const j = (await r.json()) as MeResponse;
+          if (!cancelled) setMe(j.user ?? null);
+        } else if (!cancelled) {
+          setMe(null);
+        }
+      } catch {
+        if (!cancelled) setMe(null);
+      }
 
-      const sync = PouchDB.sync(localDb, remote, { live: true, retry: true })
-        .on("change", () => setStatus("syncing"))
-        .on("paused", (err) => setStatus(err ? "paused (err)" : "paused"))
-        .on("active", () => setStatus("active"))
-        .on("denied", (e: any) => {
-          setStatus("denied");
-          console.error("[Pouch] denied", e);
+      // 3) Lokale DB
+      const localDb = new PouchDB<Entry>("times_local");
+      localDbRef.current = localDb;
+
+      // 4) Initialbestand
+      localDb
+        .allDocs({ include_docs: true })
+        .then((res) => {
+          if (cancelled) return;
+          const list = res.rows
+            .map((r) => r.doc!)
+            .filter(isTimeEntry)
+            .sort((a, b) => (a.date < b.date ? 1 : -1));
+          setDocs(list);
+        })
+        .catch((e) => console.error("[Pouch] allDocs error:", e));
+
+      // 5) Live-Changes
+      const changes = localDb
+        .changes({ since: "now", live: true, include_docs: true })
+        .on("change", (c) => {
+          const d = c.doc as Entry;
+          if (!isTimeEntry(d)) return;
+          setDocs((prev) => {
+            const i = prev.findIndex((x) => x._id === d._id);
+            if (i >= 0) {
+              const cp = prev.slice();
+              cp[i] = d;
+              return cp.sort((a, b) => (a.date < b.date ? 1 : -1));
+            }
+            return [d, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1));
+          });
         })
         .on("error", (e) => console.error("[Pouch] changes error:", e));
 
@@ -237,6 +287,7 @@ export default function ClientApp() {
           <tbody>
             {docs.map((d) => {
               const first = d.intervals?.[0] ?? { start: "", end: "", note: "" };
+              const isEditing = edit?._id === d._id;
               return (
                 <tr key={d._id}>
                   <td style={{ padding: "4px 0" }}>{d.date}</td>
