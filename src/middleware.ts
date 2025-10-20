@@ -5,15 +5,13 @@ export const config = {
 };
 
 export function middleware(req: NextRequest) {
-  // Nur prüfen, ob irgendein Token-Cookie existiert.
-  const httpOnly = req.cookies.get("access_token")?.value;
-  const publicToken = req.cookies.get("access_token_public")?.value;
+  const accessPublic = req.cookies.get("access_token_public")?.value;
+  const refresh = req.cookies.get("refresh_token")?.value;
 
-  if (httpOnly || publicToken) {
-    // reinlassen; echte Prüfung macht /api/auth/me im App-Code
+  if (accessPublic || refresh) {
+    // Client kümmert sich um Access-Refresh via /api/auth/access
     return NextResponse.next();
   }
 
-  // kein Token -> zurück zum Login
   return NextResponse.redirect(new URL("/login", req.url));
 }
