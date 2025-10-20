@@ -1,10 +1,16 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { verifyRefreshToken, signAccessToken, signRefreshToken } from "@/src/lib/jwt";
 import { ensureDbs, usersFindByEmail, usersUpdate } from "@/src/lib/couch";
 import { AppUser } from "@/src/lib/types";
+import { rateLimit } from "@/src/app/api/_utils/rate";
 
-export async function POST() {
+export async function POST(req: NextRequest) {
+  // Rate-Limit pro IP
+  const ip = (req.headers.get("x-forwarded-for") || "").split(",")[0] || "local";
+  const rl = rateLimit(`access:${ip}`);
+  if (!rl.ok) return NextResponse.json({ error: "rate limit" }, { status: 429 });
+
   const refresh = cookies().get("refresh_token")?.value;
   if (!refresh) return NextResponse.json({ error: "no refresh" }, { status: 401 });
 
@@ -16,13 +22,11 @@ export async function POST() {
     if (!u.docs.length) return NextResponse.json({ error: "user missing" }, { status: 401 });
     const doc = u.docs[0];
 
-    // ver muss exakt passen, sonst ist das Refresh-Token ungültig (Replay-Schutz)
     const currentVer = doc.refreshVer || 0;
     if (ref.ver !== currentVer) {
       return NextResponse.json({ error: "refresh version mismatch" }, { status: 401 });
     }
 
-    // Token-Rotation: Version ++, neuen Refresh + neuen Access ausstellen
     const nextVer = currentVer + 1;
     await usersUpdate<AppUser>(doc._id!, doc._rev!, { refreshVer: nextVer });
 

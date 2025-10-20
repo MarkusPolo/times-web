@@ -1,10 +1,10 @@
 // src/app/api/couchdb/[...path]/route.ts
-// Reverse Proxy von /api/couchdb/* -> CouchDB
-// - prüft Bearer (JWT) vom Client
-// - spricht CouchDB mit Basic (Admin) an
-// - filtert Audit-Logs, damit nur fachlich relevante Writes ins Log kommen
-// - unterstützt GET/HEAD/POST/PUT/DELETE/OPTIONS
-// - Node runtime, keine SSG
+// Reverse-Proxy für PouchDB-Sync auf DB "times" mit Mandanten-Isolation.
+// - prüft Bearer (JWT)
+// - spricht CouchDB mit Basic (Admin)
+// - ROLE employee: nur eigene Docs (entry:<sub>:...), _changes/_find werden serverseitig gefiltert
+// - reviewer/admin: durchgelassen (Review geschieht über /api/review/*)
+// - Audit nur für fachliche Writes (PUT/DELETE und Bulk time_entry)
 
 import { NextRequest, NextResponse } from "next/server";
 import { verifyAccessToken } from "@/src/lib/jwt";
@@ -18,14 +18,13 @@ const couchUrl = process.env.COUCHDB_URL!;
 const adminUser = process.env.COUCHDB_ADMIN_USER!;
 const adminPass = process.env.COUCHDB_ADMIN_PASS!;
 
+type Role = "employee" | "reviewer" | "admin";
+
 function unauthorized(msg = "unauthorized") {
   return NextResponse.json({ error: "unauthorized", reason: msg }, { status: 401 });
 }
-
-function buildTarget(req: NextRequest, pathParam: string[]) {
-  const path = pathParam.join("/");
-  const qs = req.nextUrl.search || "";
-  return `${couchUrl}/${path}${qs}`;
+function forbidden(msg = "forbidden") {
+  return NextResponse.json({ error: "forbidden", reason: msg }, { status: 403 });
 }
 
 function sanitizeHeaders(req: NextRequest) {
@@ -40,111 +39,83 @@ function sanitizeHeaders(req: NextRequest) {
   return h;
 }
 
-// ---- Audit-Filter-Helpers ----
-
-function isWriteMethod(method: string) {
-  return method === "POST" || method === "PUT" || method === "DELETE";
+function dbNameFromPath(parts: string[]) {
+  return parts[0] || "";
 }
-
-function isTimesDbPath(pathParts: string[]) {
-  // /api/couchdb/<db>/...  -> pathParts[0] = "<db>"
-  return pathParts.length > 0 && pathParts[0] === "times";
+function isTimesDbPath(parts: string[]) {
+  return dbNameFromPath(parts) === "times";
 }
-
-function isReplicationNoise(pathParts: string[]) {
-  // skip replication/checkpoint helpers
-  // examples: _local/<id>, _revs_diff, _changes, _bulk_get
-  if (pathParts.length < 2) return false;
-  const p1 = pathParts[1];
-  return (
-    p1 === "_revs_diff" ||
-    p1 === "_changes" ||
-    p1 === "_bulk_get" ||
-    p1 === "_design" || // vorsichtshalber
-    p1 === "_local"
-  );
+function docIdFromPath(parts: string[]) {
+  return parts[1] || "";
 }
-
-function isBulkDocs(pathParts: string[]) {
-  return pathParts[1] === "_bulk_docs";
+function isWriteMethod(m: string) {
+  return m === "POST" || m === "PUT" || m === "DELETE";
 }
-
-async function parseJsonBody(ab: ArrayBuffer | null) {
+function isReplicationNoise(parts: string[]) {
+  const p1 = parts[1];
+  return p1 === "_revs_diff" || p1 === "_changes" || p1 === "_bulk_get" || p1 === "_design" || p1 === "_local";
+}
+function isBulkDocs(parts: string[]) {
+  return parts[1] === "_bulk_docs";
+}
+function isAllDocs(parts: string[]) {
+  return parts[1] === "_all_docs";
+}
+function idIsOwnedBySub(id: string, sub: string) {
+  return id.startsWith(`entry:${sub}:`);
+}
+async function parseJson(ab: ArrayBuffer | null) {
   if (!ab) return null;
   try {
-    const text = new TextDecoder().decode(ab);
-    return JSON.parse(text);
+    const txt = new TextDecoder().decode(ab);
+    return JSON.parse(txt);
   } catch {
     return null;
   }
 }
-
-function shortlist<T>(arr: T[], n = 10): T[] {
-  return arr.slice(0, n);
+function buildUrl(base: string, parts: string[], req: NextRequest) {
+  const path = parts.join("/");
+  const u = new URL(`${base}/${path}`);
+  for (const [k, v] of req.nextUrl.searchParams.entries()) {
+    u.searchParams.set(k, v);
+  }
+  return u;
 }
 
 async function maybeAuditTimesWrite(opts: {
   method: string;
-  pathParts: string[];
+  parts: string[];
   status: number;
   actorId?: string;
   actorEmail?: string;
   reqBodyJson: any | null;
 }) {
-  const { method, pathParts, status, actorId, actorEmail, reqBodyJson } = opts;
-
+  const { method, parts, status, actorEmail, actorId, reqBodyJson } = opts;
   if (!isWriteMethod(method)) return;
-  if (!isTimesDbPath(pathParts)) return;
-  if (isReplicationNoise(pathParts)) return;
+  if (!isTimesDbPath(parts)) return;
+  if (isReplicationNoise(parts)) return;
 
-  // Case A: POST /times/_bulk_docs  -> filter docs by type === "time_entry"
-  if (isBulkDocs(pathParts)) {
+  if (isBulkDocs(parts)) {
     const docs = Array.isArray(reqBodyJson?.docs) ? reqBodyJson.docs : [];
     const entries = docs.filter((d: any) => d && d.type === "time_entry");
-    if (entries.length === 0) return;
-
+    if (!entries.length) return;
     const ids = entries.map((d: any) => d._id).filter(Boolean);
     await auditInsert({
       ts: new Date().toISOString(),
       type: "times_write",
       actorId,
       actorEmail,
-      meta: {
-        method,
-        path: "/times/_bulk_docs",
-        status,
-        count: entries.length,
-        ids: shortlist(ids, 10) // nur Vorschau
-      }
+      meta: { method, path: "/times/_bulk_docs", status, count: entries.length, ids: ids.slice(0, 10) }
     });
     return;
   }
 
-  // Case B: PUT /times/<docId>
-  // Nur loggen, wenn Body type === "time_entry"
-  if (method === "PUT" && pathParts.length >= 2) {
-    const docId = pathParts[1];
-    if (docId && !docId.startsWith("_")) {
-      if (reqBodyJson && reqBodyJson.type === "time_entry") {
-        await auditInsert({
-          ts: new Date().toISOString(),
-          type: "times_write",
-          actorId,
-          actorEmail,
-          meta: { method, path: `/times/${docId}`, status, id: docId }
-        });
-      }
-    }
-    return;
-  }
-
-  // Case C: DELETE /times/<docId>  (selten, aber fachlich relevant)
-  if (method === "DELETE" && pathParts.length >= 2) {
-    const docId = pathParts[1];
-    if (docId && !docId.startsWith("_")) {
+  const docId = docIdFromPath(parts);
+  if (method === "PUT" && docId && !docId.startsWith("_")) {
+    if (reqBodyJson?.type === "time_entry") {
       await auditInsert({
         ts: new Date().toISOString(),
-        type: "times_delete",
+        type: "times_write",
         actorId,
         actorEmail,
         meta: { method, path: `/times/${docId}`, status, id: docId }
@@ -153,86 +124,140 @@ async function maybeAuditTimesWrite(opts: {
     return;
   }
 
-  // POST /times (direktes Anlegen ohne _bulk_docs) – kommt bei Pouch selten vor,
-  // wir werten es nur, wenn der Body eine time_entry hat.
-  if (method === "POST" && pathParts.length === 1) {
-    if (reqBodyJson && reqBodyJson.type === "time_entry") {
-      await auditInsert({
-        ts: new Date().toISOString(),
-        type: "times_write",
-        actorId,
-        actorEmail,
-        meta: { method, path: `/times`, status }
-      });
-    }
+  if (method === "DELETE" && docId && !docId.startsWith("_")) {
+    await auditInsert({
+      ts: new Date().toISOString(),
+      type: "times_delete",
+      actorId,
+      actorEmail,
+      meta: { method, path: `/times/${docId}`, status, id: docId }
+    });
   }
 }
 
 async function forward(req: NextRequest, ctx: { params: { path: string[] } }) {
-  // 1) Bearer prüfen (vom Browser)
+  // 1) Bearer prüfen
   const auth = req.headers.get("authorization") || "";
   const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : null;
   if (!bearer) return unauthorized("missing bearer");
 
-  let actorEmail: string | undefined;
-  let actorId: string | undefined;
+  let sub = "";
+  let email = "";
+  let role: Role = "employee";
   try {
-    const payload = verifyAccessToken(bearer);
-    actorEmail = (payload as any).email;
-    actorId = (payload as any).sub;
+    const p = verifyAccessToken(bearer);
+    sub = (p as any).sub;
+    email = (p as any).email;
+    role = (p as any).role as Role;
   } catch {
     return unauthorized("invalid token");
   }
 
-  // 2) Ziel bauen
-  const target = buildTarget(req, ctx.params.path);
-
-  // 3) Request vorbereiten
+  const parts = ctx.params.path;
   const method = req.method.toUpperCase();
-  const headers = sanitizeHeaders(req);
 
-  // Body einmal lesen (damit wir ihn ggf. für Audit analysieren können)
+  // 2) Nur DB "times" erlauben
+  if (!isTimesDbPath(parts)) return forbidden("db not allowed");
+
+  // 3) ROLE employee → Isolation erzwingen
+  const isEmployee = role === "employee";
+  const url = buildUrl(couchUrl, parts, req);
+
+  // a) _all_docs mit include_docs blocken
+  if (isAllDocs(parts)) {
+    return forbidden("all_docs not allowed");
+  }
+
+  // b) _changes → serverseitiger selector
+  if (parts[1] === "_changes" && isEmployee) {
+    url.searchParams.set("filter", "_selector");
+    url.searchParams.set("selector", JSON.stringify({ employeeId: sub }));
+  }
+
+  // c) _find → selector um employeeId ergänzen/setzen
+  if (parts[1] === "_find" && isEmployee) {
+    const ab = !["GET", "HEAD"].includes(method) ? await req.arrayBuffer() : null;
+    const bodyJson = await parseJson(ab);
+    const sel = bodyJson?.selector && typeof bodyJson.selector === "object" ? bodyJson.selector : {};
+    const merged = { ...sel, employeeId: sub };
+    const newBody = JSON.stringify({ ...bodyJson, selector: merged });
+    const headers = sanitizeHeaders(req);
+    headers.set("content-type", "application/json");
+
+    const res = await fetch(url.toString(), { method, headers, body: newBody, redirect: "manual" });
+    const out = new Headers(res.headers);
+    out.delete("transfer-encoding");
+    out.delete("connection");
+    out.set("access-control-expose-headers", "*");
+    return new NextResponse(res.body, { status: res.status, headers: out });
+  }
+
+  // d) Einzel-Dokumente nur bei eigener ID
+  const singleDocId = docIdFromPath(parts);
+  if (singleDocId && !singleDocId.startsWith("_") && isEmployee) {
+    if (!idIsOwnedBySub(singleDocId, sub)) {
+      return forbidden("document not owned by user");
+    }
+  }
+
+  // e) Writes validieren (Bulk & Einzel)
   let bodyAb: ArrayBuffer | null = null;
   if (!["GET", "HEAD"].includes(method)) {
     bodyAb = await req.arrayBuffer();
   }
+  const bodyJson = await parseJson(bodyAb);
 
-  // 4) an CouchDB schicken
-  const res = await fetch(target, {
+  if (isEmployee && isWriteMethod(method)) {
+    if (isBulkDocs(parts)) {
+      const docs = Array.isArray(bodyJson?.docs) ? bodyJson.docs : [];
+      for (const d of docs) {
+        const id = d?._id || "";
+        const emp = d?.employeeId || "";
+        if (!idIsOwnedBySub(id, sub) || emp !== sub) {
+          return forbidden("bulk contains foreign document");
+        }
+      }
+    }
+    if (method === "PUT" && singleDocId && !singleDocId.startsWith("_")) {
+      const okId = idIsOwnedBySub(singleDocId, sub);
+      const okEmp = bodyJson?.employeeId === sub;
+      if (!okId || !okEmp) return forbidden("foreign document write");
+    }
+  }
+
+  // 4) Forward
+  const headers = sanitizeHeaders(req);
+  const res = await fetch(url.toString(), {
     method,
     headers,
-    body: bodyAb ? bodyAb : undefined,
+    body: bodyAb || undefined,
     redirect: "manual"
   });
 
-  // 5) Antwort-Header filtern & durchreichen
+  // 5) Antwort säubern
   const outHeaders = new Headers(res.headers);
   outHeaders.delete("transfer-encoding");
   outHeaders.delete("connection");
   outHeaders.set("access-control-expose-headers", "*");
 
-  // 6) Audit (gefiltert) – NACH der Antwort (wir kennen nun den Status)
+  // 6) Audit
   try {
-    const pathParts = ctx.params.path;
-    const status = res.status;
-    const reqBodyJson = await parseJsonBody(bodyAb);
     await maybeAuditTimesWrite({
       method,
-      pathParts,
-      status,
-      actorEmail,
-      actorId,
-      reqBodyJson
+      parts,
+      status: res.status,
+      actorEmail: email,
+      actorId: sub,
+      reqBodyJson: bodyJson
     });
   } catch (e) {
-    // Audit-Fehler sollen den Proxy nicht stören
     console.warn("[proxy/audit] skipped due to error:", e);
   }
 
   return new NextResponse(res.body, { status: res.status, headers: outHeaders });
 }
 
-// Handler
+// HTTP-Methoden
 export async function GET(req: NextRequest, ctx: { params: { path: string[] } }) {
   return forward(req, ctx);
 }
