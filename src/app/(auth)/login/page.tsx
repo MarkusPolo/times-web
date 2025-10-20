@@ -21,15 +21,10 @@ export default function LoginPage() {
       setError(j.error || "Login fehlgeschlagen");
       return;
     }
-
-    // Token lokal für PouchDB-Proxy
     if (j?.token) {
       localStorage.setItem("access_token", j.token);
-      // Fallback-Cookie für Middleware (15 Minuten)
       document.cookie = `access_token_public=${j.token}; Path=/; Max-Age=900; SameSite=Lax`;
     }
-
-    // Harte Navigation (um Dev-Runtime/Router-Zicken zu vermeiden)
     window.location.href = "/app";
   };
 
@@ -42,9 +37,7 @@ export default function LoginPage() {
         <button type="submit">Einloggen</button>
       </form>
       {error && <p style={{ color: "crimson" }}>{error}</p>}
-      <p>
-        Noch kein Konto? <a href="/register">Registrieren</a>
-      </p>
+      <p style={{ color: "#666", fontSize: 12 }}>Registrierung ist deaktiviert. Konten werden durch den Personaler angelegt.</p>
     </main>
   );
 }

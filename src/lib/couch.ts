@@ -6,7 +6,6 @@ export const dbUsers = process.env.COUCHDB_DB_USERS || "users";
 
 if (!couchUrl || !adminUser || !adminPass) throw new Error("CouchDB env missing");
 
-// Basic Auth Header einmal berechnen
 const basic = "Basic " + Buffer.from(`${adminUser}:${adminPass}`).toString("base64");
 
 async function couchFetch(path: string, init?: RequestInit) {
@@ -17,23 +16,19 @@ async function couchFetch(path: string, init?: RequestInit) {
       "content-type": "application/json",
       authorization: basic,
       ...(init?.headers || {})
-    },
-    // kein Proxy, keep it simple
+    }
   });
   if (!res.ok) {
     let body: any = null;
     try {
       body = await res.json();
-    } catch {
-      // ignore
-    }
+    } catch {}
     const err: any = new Error(body?.reason || res.statusText);
     err.status = res.status;
     err.body = body;
     err.url = url;
     throw err;
   }
-  // CouchDB antwortet JSON
   if (res.status !== 204) {
     return res.json();
   }
@@ -47,6 +42,36 @@ export async function ensureDbs() {
       await couchFetch(`/${encodeURIComponent(name)}`, { method: "PUT" });
     }
   }
+  await ensureIndexes();
+}
+
+async function ensureIndexes() {
+  await couchFetch(`/${encodeURIComponent(dbUsers)}/_index`, {
+    method: "POST",
+    body: JSON.stringify({
+      index: { fields: ["email"] },
+      name: "idx_users_email",
+      type: "json"
+    })
+  }).catch(() => {});
+
+  await couchFetch(`/${encodeURIComponent(dbTimes)}/_index`, {
+    method: "POST",
+    body: JSON.stringify({
+      index: { fields: ["date"] },
+      name: "idx_times_date",
+      type: "json"
+    })
+  }).catch(() => {});
+
+  await couchFetch(`/${encodeURIComponent(dbTimes)}/_index`, {
+    method: "POST",
+    body: JSON.stringify({
+      index: { fields: ["employeeId"] },
+      name: "idx_times_employeeId",
+      type: "json"
+    })
+  }).catch(() => {});
 }
 
 export type FindResult<T> = { docs: (T & { _id: string; _rev: string })[] };
@@ -54,10 +79,7 @@ export type FindResult<T> = { docs: (T & { _id: string; _rev: string })[] };
 export async function usersFindByEmail<T = any>(email: string): Promise<FindResult<T>> {
   return couchFetch(`/${encodeURIComponent(dbUsers)}/_find`, {
     method: "POST",
-    body: JSON.stringify({
-      selector: { email },
-      limit: 1
-    })
+    body: JSON.stringify({ selector: { email }, limit: 1 })
   });
 }
 
@@ -65,6 +87,42 @@ export async function usersInsert<T = any>(doc: T) {
   return couchFetch(`/${encodeURIComponent(dbUsers)}`, {
     method: "POST",
     body: JSON.stringify(doc)
+  });
+}
+
+export async function usersAll<T = any>(limit = 500): Promise<FindResult<T>> {
+  return couchFetch(`/${encodeURIComponent(dbUsers)}/_find`, {
+    method: "POST",
+    body: JSON.stringify({ selector: {}, limit, sort: [{ email: "asc" }] })
+  });
+}
+
+export async function usersUpdate<T = any>(id: string, rev: string, patch: Partial<T>) {
+  const doc = await couchFetch(`/${encodeURIComponent(dbUsers)}/${encodeURIComponent(id)}`);
+  const merged = { ...doc, ...patch, _rev: doc._rev };
+  return couchFetch(`/${encodeURIComponent(dbUsers)}/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    body: JSON.stringify(merged)
+  });
+}
+
+export async function timesFind<T = any>(selector: any, limit = 2000): Promise<FindResult<T>> {
+  return couchFetch(`/${encodeURIComponent(dbTimes)}/_find`, {
+    method: "POST",
+    body: JSON.stringify({ selector, limit, sort: [{ date: "desc" }] })
+  });
+}
+
+export async function timesGet<T = any>(id: string): Promise<T & { _id: string; _rev: string }> {
+  return couchFetch(`/${encodeURIComponent(dbTimes)}/${encodeURIComponent(id)}`);
+}
+
+export async function timesUpdate<T = any>(id: string, patch: Partial<T>) {
+  const doc = await timesGet<T & { _rev: string }>(id);
+  const merged = { ...doc, ...patch, _rev: doc._rev };
+  return couchFetch(`/${encodeURIComponent(dbTimes)}/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    body: JSON.stringify(merged)
   });
 }
 

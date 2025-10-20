@@ -7,7 +7,13 @@ type MeResponse = {
   user?: { sub: string; role: "employee" | "reviewer" | "admin"; email: string; mustChangePassword?: boolean };
 };
 
-export default function AuthGuard({ children }: { children: React.ReactNode }) {
+export default function RoleGuard({
+  allow,
+  children
+}: {
+  allow: Array<"employee" | "reviewer" | "admin">;
+  children: React.ReactNode;
+}) {
   const [ok, setOk] = useState<null | boolean>(null);
 
   useEffect(() => {
@@ -20,7 +26,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
       }
       const j = (await r.json()) as MeResponse;
 
-      // Enforcement: muss zuerst Passwort ändern
+      // Passwortwechsel erzwingen
       if (j.user?.mustChangePassword && typeof window !== "undefined") {
         const path = window.location.pathname;
         if (!path.startsWith("/change-password")) {
@@ -28,11 +34,12 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
           return;
         }
       }
-      setOk(true);
+
+      setOk(!!j.user && allow.includes(j.user.role));
     })();
-  }, []);
+  }, [allow]);
 
   if (ok === null) return <p>Lade…</p>;
-  if (!ok) return null;
+  if (!ok) return <p>Kein Zugriff.</p>;
   return <>{children}</>;
 }
