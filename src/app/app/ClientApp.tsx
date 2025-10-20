@@ -6,12 +6,14 @@ import { DateTime } from "luxon";
 import AuthGuard from "@/src/components/AuthGuard";
 import TimesForm from "@/src/components/TimesForm";
 
+type Interval = { start: string; end: string; note?: string };
 type Entry = {
   _id?: string;
   _rev?: string;
+  type: "time_entry";
   employeeId: string;
   date: string; // YYYY-MM-DD
-  intervals: { start: string; end: string; note?: string }[];
+  intervals: Interval[];
   updatedAt: string;
 };
 
@@ -19,6 +21,10 @@ type MeResponse = {
   authenticated: boolean;
   user?: { sub: string; role: "employee" | "reviewer" | "admin"; email: string };
 };
+
+function isTimeEntry(d: any): d is Entry {
+  return d && d.type === "time_entry" && Array.isArray(d.intervals) && typeof d.date === "string";
+}
 
 export default function ClientApp() {
   const [docs, setDocs] = useState<Entry[]>([]);
@@ -31,10 +37,9 @@ export default function ClientApp() {
   useEffect(() => {
     let cancelled = false;
 
-    // 1) Token aus localStorage (für Bearer -> Proxy)
     tokenRef.current = localStorage.getItem("access_token");
 
-    // 2) Userdaten holen (für employeeId)
+    // User laden (für employeeId)
     (async () => {
       const r = await fetch("/api/auth/me");
       if (r.ok) {
@@ -45,41 +50,42 @@ export default function ClientApp() {
       }
     })();
 
-    // 3) Lokale DB öffnen
+    // Lokale DB
     const localDb = new PouchDB<Entry>("times_local");
     localDbRef.current = localDb;
 
-    // 4) Startbestand laden
+    // Initialbestand
     localDb
       .allDocs({ include_docs: true })
       .then((res) => {
         if (cancelled) return;
-        setDocs(res.rows.map((r) => r.doc!) as Entry[]);
+        const list = res.rows
+          .map((r) => r.doc!)
+          .filter(isTimeEntry)
+          .sort((a, b) => (a.date < b.date ? 1 : -1));
+        setDocs(list);
       })
-      .catch((e) => {
-        console.error("[Pouch] allDocs error:", e);
-      });
+      .catch((e) => console.error("[Pouch] allDocs error:", e));
 
-    // 5) Live-Changes
+    // Live-Changes
     const changes = localDb
       .changes({ since: "now", live: true, include_docs: true })
       .on("change", (c) => {
         const d = c.doc as Entry;
+        if (!isTimeEntry(d)) return; // ignorier alte/inkonsistente Docs
         setDocs((prev) => {
           const i = prev.findIndex((x) => x._id === d._id);
           if (i >= 0) {
             const cp = prev.slice();
             cp[i] = d;
-            return cp;
+            return cp.sort((a, b) => (a.date < b.date ? 1 : -1));
           }
-          return [d, ...prev];
+          return [d, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1));
         });
       })
-      .on("error", (e) => {
-        console.error("[Pouch] changes error:", e);
-      });
+      .on("error", (e) => console.error("[Pouch] changes error:", e));
 
-    // 6) Replikation starten (absolute URL!)
+    // Replikation
     let cancelSync: (() => void) | null = null;
     const token = tokenRef.current;
 
@@ -92,22 +98,13 @@ export default function ClientApp() {
         return fetch(url, { ...opts, headers: h });
       };
 
-      // @ts-ignore: PouchDB erlaubt fetch-Override
+      // @ts-ignore fetch-Override ist in pouchdb-browser erlaubt
       const remote = new PouchDB<Entry>(remoteUrl, { fetch: fetchWithBearer });
 
       const sync = PouchDB.sync(localDb, remote, { live: true, retry: true })
-        .on("change", (info) => {
-          setStatus("syncing");
-          // Debug-Ausgabe hilft bei Problemen
-          console.debug("[Pouch] change", info);
-        })
-        .on("paused", (err) => {
-          setStatus("paused");
-          if (err) console.warn("[Pouch] paused with error:", err);
-        })
-        .on("active", () => {
-          setStatus("active");
-        })
+        .on("change", () => setStatus("syncing"))
+        .on("paused", (err) => setStatus(err ? "paused (err)" : "paused"))
+        .on("active", () => setStatus("active"))
         .on("denied", (e: any) => {
           setStatus("denied");
           console.error("[Pouch] denied", e);
@@ -140,6 +137,7 @@ export default function ClientApp() {
 
     const e: Entry = {
       _id: id,
+      type: "time_entry",
       employeeId,
       date: payload.date,
       intervals: [{ start: payload.start, end: payload.end, note: payload.note }],
@@ -166,17 +164,18 @@ export default function ClientApp() {
             </tr>
           </thead>
           <tbody>
-            {docs
-              .sort((a, b) => (a.date < b.date ? 1 : -1))
-              .map((d) => (
+            {docs.map((d) => {
+              const first = d.intervals?.[0] ?? { start: "", end: "", note: "" };
+              return (
                 <tr key={d._id}>
                   <td style={{ padding: "4px 0" }}>{d.date}</td>
-                  <td>{d.intervals[0]?.start}</td>
-                  <td>{d.intervals[0]?.end}</td>
-                  <td>{d.intervals[0]?.note || ""}</td>
+                  <td>{first.start}</td>
+                  <td>{first.end}</td>
+                  <td>{first.note || ""}</td>
                   <td>{DateTime.fromISO(d.updatedAt).toFormat("dd.LL.yyyy HH:mm")}</td>
                 </tr>
-              ))}
+              );
+            })}
           </tbody>
         </table>
       </main>
