@@ -5,6 +5,7 @@ import PouchDB from "pouchdb-browser";
 import { DateTime } from "luxon";
 import AuthGuard from "@/src/components/AuthGuard";
 import TimesForm from "@/src/components/TimesForm";
+import LogoutButton from "@/src/components/LogoutButton";
 
 type Interval = { start: string; end: string; note?: string };
 type Entry = {
@@ -31,27 +32,41 @@ export default function ClientApp() {
   const [status, setStatus] = useState<string>("init");
   const [me, setMe] = useState<MeResponse["user"] | null>(null);
 
+  const [edit, setEdit] = useState<null | Entry>(null);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
+  const [okMsg, setOkMsg] = useState<string | null>(null);
+
   const localDbRef = useRef<PouchDB.Database<Entry> | null>(null);
   const tokenRef = useRef<string | null>(null);
   const syncCancelRef = useRef<(() => void) | null>(null);
 
-  // --- Access-Token via Refresh-Cookie nachladen/erneuern ---
+  // Refresh-Entzerrung (verhindert Doppelaufrufe während Rotation)
+  const refreshLockRef = useRef(false);
+  const lastRefreshOkAtRef = useRef<number>(0);
+
   async function refreshAccessToken() {
+    // Wenn gerade ein Refresh läuft, nicht noch einen starten
+    if (refreshLockRef.current) return false;
+
+    refreshLockRef.current = true;
     try {
       const r = await fetch("/api/auth/access", { method: "POST" });
-      if (!r.ok) return;
-      const j = await r.json();
+      if (!r.ok) return false;
+      const j = await r.json().catch(() => null);
       if (j?.token) {
         tokenRef.current = j.token;
-        localStorage.setItem("access_token", j.token); // nur fürs Proxy-Bearer (MVP)
+        localStorage.setItem("access_token", j.token); // nur für Proxy-Bearer (MVP)
+        lastRefreshOkAtRef.current = Date.now();
 
         // Falls bisher kein Sync läuft, jetzt starten
-        if (!syncCancelRef.current) {
-          startSync();
-        }
+        if (!syncCancelRef.current) startSync();
+        return true;
       }
+      return false;
     } catch {
-      // offline/fehler -> ignorieren
+      return false;
+    } finally {
+      refreshLockRef.current = false;
     }
   }
 
@@ -84,13 +99,12 @@ export default function ClientApp() {
         console.error("[Pouch] denied", e);
       })
       .on("error", async (e: any) => {
-        // Viele Fehler sind temporär. Bei 401/403 sofort re-auth versuchen.
-        const msg = String(e?.status || e?.statusCode || e?.name || e?.message || "error");
-        if (e?.status === 401 || e?.status === 403 || /unauth/i.test(msg)) {
+        const code = e?.status || e?.statusCode;
+        // 401/403 -> sofort reauth versuchen, aber Doppelaufrufe vermeiden
+        if (code === 401 || code === 403) {
           setStatus("reauth…");
-          await refreshAccessToken();
-          // kein cancel – der Sync läuft mit retry:true weiter und bekommt dann neues Token
-          return;
+          const ok = await refreshAccessToken();
+          if (ok) return; // Sync mit retry:true holt sich neues Token automatisch
         }
         setStatus("error");
         console.error("[Pouch] sync error", e);
@@ -107,7 +121,7 @@ export default function ClientApp() {
     let cancelled = false;
 
     (async () => {
-      // 1) Initiales Access-Token holen
+      // 1) Initial versuchen, Access zu holen (via Refresh)
       await refreshAccessToken();
 
       // 2) User laden (für employeeId)
@@ -127,7 +141,7 @@ export default function ClientApp() {
       const localDb = new PouchDB<Entry>("times_local");
       localDbRef.current = localDb;
 
-      // 4) Initialbestand (nur gültige time_entry-Dokumente)
+      // 4) Initialbestand
       localDb
         .allDocs({ include_docs: true })
         .then((res) => {
@@ -163,7 +177,9 @@ export default function ClientApp() {
 
       // 7) regelmäßiger Refresh (alle 10 Minuten)
       const iv = setInterval(() => {
-        refreshAccessToken();
+        // Wenn kurz zuvor schon erfolgreich refresht wurde, nicht spammen
+        if (Date.now() - lastRefreshOkAtRef.current < 3000) return;
+        void refreshAccessToken();
       }, 10 * 60 * 1000);
 
       return () => {
@@ -190,14 +206,72 @@ export default function ClientApp() {
       updatedAt: new Date().toISOString()
     };
     await localDbRef.current.put(e);
+    setOkMsg("Eintrag hinzugefügt.");
+    setTimeout(() => setOkMsg(null), 2000);
+  };
+
+  const beginEdit = (d: Entry) => {
+    setErrMsg(null);
+    setOkMsg(null);
+    setEdit(d);
+  };
+
+  const saveEdit = async (payload: { start: string; end: string; note?: string }) => {
+    if (!localDbRef.current || !edit?._id || !edit._rev) return;
+    try {
+      setErrMsg(null);
+      const next: Entry = {
+        ...edit,
+        intervals: [{ start: payload.start, end: payload.end, note: payload.note }],
+        updatedAt: new Date().toISOString()
+      };
+      const res = await localDbRef.current.put(next);
+
+      // Erfolgsfeedback: Edit schließen + kurze Meldung
+      setEdit(null);
+      setOkMsg("Änderungen gespeichert.");
+      setTimeout(() => setOkMsg(null), 2000);
+
+      // Optimistisch _rev aktualisieren, falls Doc gerade in State steckt
+      setDocs((prev) => prev.map((d) => (d._id === next._id ? { ...next, _rev: res.rev } : d)));
+    } catch (e: any) {
+      if (e?.status === 409) {
+        setErrMsg("Konflikt: Die Version ist veraltet. Bitte Ansicht aktualisieren.");
+        setStatus("conflict");
+      } else {
+        setErrMsg("Speichern fehlgeschlagen.");
+      }
+    }
+  };
+
+  const cancelEdit = () => setEdit(null);
+
+  const removeEntry = async (d: Entry) => {
+    if (!localDbRef.current || !d._id || !d._rev) return;
+    try {
+      await localDbRef.current.remove({ _id: d._id, _rev: d._rev });
+      if (edit?._id === d._id) setEdit(null);
+      setOkMsg("Eintrag gelöscht.");
+      setTimeout(() => setOkMsg(null), 2000);
+    } catch {
+      setErrMsg("Löschen fehlgeschlagen.");
+    }
   };
 
   return (
     <AuthGuard>
       <main>
-        <h1>Meine Zeiten</h1>
+        <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h1>Meine Zeiten</h1>
+          <LogoutButton />
+        </header>
+
         <p>Status: {status}</p>
+        {okMsg && <p style={{ color: "green" }}>{okMsg}</p>}
+        {errMsg && <p style={{ color: "crimson" }}>{errMsg}</p>}
+
         <TimesForm onAdd={addEntry} />
+
         <h2>Einträge</h2>
         <table style={{ borderCollapse: "collapse", width: "100%" }}>
           <thead>
@@ -207,11 +281,13 @@ export default function ClientApp() {
               <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Ende</th>
               <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Notiz</th>
               <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Aktualisiert</th>
+              <th style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>Aktionen</th>
             </tr>
           </thead>
           <tbody>
             {docs.map((d) => {
               const first = d.intervals?.[0] ?? { start: "", end: "", note: "" };
+              const isEditing = edit?._id === d._id;
               return (
                 <tr key={d._id}>
                   <td style={{ padding: "4px 0" }}>{d.date}</td>
@@ -219,12 +295,70 @@ export default function ClientApp() {
                   <td>{first.end}</td>
                   <td>{first.note || ""}</td>
                   <td>{DateTime.fromISO(d.updatedAt).toFormat("dd.LL.yyyy HH:mm")}</td>
+                  <td>
+                    {!isEditing ? (
+                      <>
+                        <button onClick={() => beginEdit(d)} style={{ marginRight: 6 }}>
+                          Bearbeiten
+                        </button>
+                        <button onClick={() => removeEntry(d)}>Löschen</button>
+                      </>
+                    ) : (
+                      <span style={{ color: "#888" }}>Wird unten bearbeitet…</span>
+                    )}
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
+
+        {edit && (
+          <section style={{ marginTop: 16, padding: 12, border: "1px solid #ddd" }}>
+            <h3>Eintrag bearbeiten</h3>
+            <EditForm
+              initial={edit.intervals?.[0] ?? { start: "", end: "", note: "" }}
+              onSave={saveEdit}
+              onCancel={cancelEdit}
+            />
+          </section>
+        )}
       </main>
     </AuthGuard>
+  );
+}
+
+// Kleine Inline-Edit-Form
+function EditForm({
+  initial,
+  onSave,
+  onCancel
+}: {
+  initial: { start: string; end: string; note?: string };
+  onSave: (p: { start: string; end: string; note?: string }) => void | Promise<void>;
+  onCancel: () => void;
+}) {
+  const [start, setStart] = useState(initial.start);
+  const [end, setEnd] = useState(initial.end);
+  const [note, setNote] = useState(initial.note || "");
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSave({ start, end, note });
+      }}
+      style={{ display: "grid", gap: 8, maxWidth: 400 }}
+    >
+      <input aria-label="Start" type="time" value={start} onChange={(e) => setStart(e.target.value)} />
+      <input aria-label="Ende" type="time" value={end} onChange={(e) => setEnd(e.target.value)} />
+      <input aria-label="Notiz" placeholder="Notiz" value={note} onChange={(e) => setNote(e.target.value)} />
+      <div style={{ display: "flex", gap: 8 }}>
+        <button type="submit">Speichern</button>
+        <button type="button" onClick={onCancel}>
+          Abbrechen
+        </button>
+      </div>
+    </form>
   );
 }

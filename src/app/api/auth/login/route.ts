@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { AppUser } from "@/src/lib/types";
 import { signAccessToken, signRefreshToken } from "@/src/lib/jwt";
-import { ensureDbs, usersFindByEmail, auditInsert } from "@/src/lib/couch";
+import { ensureDbs, usersFindByEmail, usersUpdate, auditInsert } from "@/src/lib/couch";
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
@@ -18,8 +18,12 @@ export async function POST(req: NextRequest) {
   const ok = await bcrypt.compare(password, doc.passwordHash);
   if (!ok) return NextResponse.json({ error: "invalid credentials" }, { status: 401 });
 
+  // Refresh-Version rotieren (neue Session)
+  const nextVer = (doc.refreshVer || 0) + 1;
+  await usersUpdate<AppUser>(doc._id!, doc._rev!, { refreshVer: nextVer });
+
   const access = signAccessToken({ sub: doc._id!, role: doc.role, email: doc.email }, "15m");
-  const refresh = signRefreshToken({ sub: doc._id!, email: doc.email, ver: 1 }, "7d");
+  const refresh = signRefreshToken({ sub: doc._id!, email: doc.email, ver: nextVer }, "7d");
 
   await auditInsert({
     ts: new Date().toISOString(),
@@ -35,32 +39,11 @@ export async function POST(req: NextRequest) {
     token: access
   });
 
-  // 1) httpOnly ACCESS cookie (15m) -> wichtig für getAuth()/api/auth/me
-  resp.cookies.set("access_token", access, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: false,
-    path: "/",
-    maxAge: 60 * 15
-  });
+  const common = { path: "/", sameSite: "lax", secure: false } as const;
 
-  // 2) httpOnly REFRESH cookie (7d)
-  resp.cookies.set("refresh_token", refresh, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: false,
-    path: "/",
-    maxAge: 60 * 60 * 24 * 7
-  });
-
-  // 3) optionales Public-Cookie für Middleware/Client (15m)
-  resp.cookies.set("access_token_public", access, {
-    httpOnly: false,
-    sameSite: "lax",
-    secure: false,
-    path: "/",
-    maxAge: 60 * 15
-  });
+  resp.cookies.set("access_token", access, { ...common, httpOnly: true, maxAge: 60 * 15 });
+  resp.cookies.set("access_token_public", access, { ...common, httpOnly: false, maxAge: 60 * 15 });
+  resp.cookies.set("refresh_token", refresh, { ...common, httpOnly: true, maxAge: 60 * 60 * 24 * 7 });
 
   return resp;
 }
